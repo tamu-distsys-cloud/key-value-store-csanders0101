@@ -2,23 +2,21 @@
 #                               Academic Honesty
 # ------------------------------------------------------------------------------
 #
-# This project implementation (`client.py`, `server.py`) was developed with 
-# structured assistance from **ChatGPT o3**. The AI was used to guide design 
-# decisions, explain unclear requirements, and improve documentation and code 
-# structure via multiple iterative prompts.
+# This project (`client.py`, `server.py`) was developed using structured help 
+# from **ChatGPT o3**. The AI assisted with design strategy, clarifying ambiguous 
+# instructions, and enhancing code organization/documentation through multiple 
+# iterations.
 #
-# Contributions included:
-# - Static key-to-shard mapping logic
-# - Client retry loops with replica fallback
-# - Handling of duplicate requests via client sequence tracking
-# - Thread-safe updates using locks
-# - Passing all course-provided test cases (e.g., `test_test.py`)
+# Specific guidance included:
+# - Mapping keys deterministically to shards
+# - Resilient client-side retries with fallback across replicas
+# - Deduplication of client requests using sequence tracking
+# - Ensuring thread-safety through locking
+# - Compatibility with all required course test cases (e.g., `test_test.py`)
 #
-# No other external sources or third-party libraries (beyond course-provided files)
-# were used in creating this submission.
+# No other tools, libraries, or sources (beyond course materials) were involved.
 #
 # ------------------------------------------------------------------------------
-
 
 import random, time
 import threading
@@ -31,39 +29,36 @@ def nrand() -> int:
     return random.getrandbits(62)
 
 def _key_id(key: str) -> int:
-    # Convert a string key into a consistent non-negative integer
-    return int(key) if key.isdigit() else sum(ord(c) for c in key)
+    # Map a string key to a stable, non-negative integer
+    return int(key) if key.isdigit() else sum(ord(ch) for ch in key)
 
 class Clerk:
     def __init__(self, servers: List[ClientEnd], cfg):
         self.servers = servers
-        self.cfg = cfg
-        self.id        = nrand()
-        self.lock = threading.Lock()
-        self.seq       = 0 
-        self.last_rep  = {}        # Maps shard ID to preferred replica offset
+        self.cfg     = cfg
+        self.id      = nrand()
+        self.lock    = threading.Lock()
+        self.seq     = 0
+        self.last_replica = {}  # shard_id → last successful replica offset
 
     def _call(self, rpc: str, args, shard: int):
-        n  = self.cfg.nservers
-        R  = self.cfg.nreplicas
-        start_off = self.last_rep.get(shard, 0)
+        num_servers = self.cfg.nservers
+        num_replicas = self.cfg.nreplicas
+        offset = self.last_replica.get(shard, 0)
+        timeout = time.time() + 2.0
 
-        deadline = time.time() + 2.0  # Timeout limit for this operation
-        while time.time() < deadline:
-            for k in range(R):
-                shard_id = (shard + (start_off + k) % R) % n
+        while time.time() < timeout:
+            for attempt in range(num_replicas):
+                replica_id = (shard + (offset + attempt) % num_replicas) % num_servers
                 try:
-                    rep = self.servers[shard_id].call(rpc, args)
-                    self.last_rep[shard] = (start_off + k) % R
-                    return rep
+                    reply = self.servers[replica_id].call(rpc, args)
+                    self.last_replica[shard] = (offset + attempt) % num_replicas
+                    return reply
                 except TimeoutError:
                     continue
-            time.sleep(0.05)  # Brief pause before retrying replicas
+            time.sleep(0.05)  # Retry delay between replica attempts
 
-        # If all replicas fail for the given shard within the timeout window
-        raise TimeoutError()
-
-
+        raise TimeoutError("RPC call failed across all replicas within deadline.")
     # Fetch the current value for a key.
     # Returns "" if the key does not exist.
     # Keeps trying forever in the face of all other errors.
@@ -76,10 +71,15 @@ class Clerk:
     # must match the declared types of the RPC handler function's
     # arguments in server.py.
     def get(self, key: str) -> str:
+        
+        #Retrieve the current value associated with `key`.
+        #Will retry indefinitely on transient errors.
+        #Returns an empty string if key is missing.
+        
         shard = _key_id(key) % self.cfg.nservers
-        args  = GetArgs(key)
-        rep: GetReply = self._call("KVServer.Get", args, shard)
-        return rep.value
+        args = GetArgs(key)
+        response: GetReply = self._call("KVServer.Get", args, shard)
+        return response.value
     # Shared by Put and Append.
     #
     # You can send an RPC with code like this:
@@ -90,15 +90,20 @@ class Clerk:
     # must match the declared types of the RPC handler function's
     # arguments in server.py.
     def put_append(self, key: str, value: str, op: str) -> str:
+        #Internal method shared by Put and Append operations.
+        #Tracks request sequence to enable deduplication.
+        
         shard = _key_id(key) % self.cfg.nservers
-        self.seq += 1
-        args = PutAppendArgs(key, value, self.id, self.seq)
-        rep: PutAppendReply = self._call(f"KVServer.{op}", args, shard)
-        return rep.value if rep is not None else ""
+        with self.lock:
+            self.seq += 1
+            args = PutAppendArgs(key, value, self.id, self.seq)
+        response: PutAppendReply = self._call(f"KVServer.{op}", args, shard)
+        return response.value if response else ""
 
     def put(self, key: str, value: str):
+        #Insert or overwrite the value associated with `key`.
         self.put_append(key, value, "Put")
 
-    # Append value to key's value and return that value
     def append(self, key: str, value: str) -> str:
+        #Append `value` to existing content at `key`, returning result.
         return self.put_append(key, value, "Append")

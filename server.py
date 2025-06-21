@@ -23,94 +23,94 @@ import logging, threading, random
 import time, math
 from typing import Tuple, Any
 
-
 debugging = False
 
-# Use this function for debugging
+# For debug tracing, toggle this function on/off via the flag above
 def debug(format, *args):
     if debugging:
         logging.info(format % args)
 
+# Convert string key into a reproducible shard ID
 def _key_id(key: str) -> int:
-    # Convert string to consistent positive integer for shard mapping
     return int(key) if key.isdigit() else sum(ord(c) for c in key)
 
-# Put or Append
+# Struct to hold Put/Append RPC request parameters
 class PutAppendArgs:
-    # Holds data for Put or Append requests
     def __init__(self, key: str, value: str, client_id: int, seq: int):
         self.key, self.value, self.client_id, self.seq = key, value, client_id, seq
+
+# Struct to hold the response from a Put or Append operation
 class PutAppendReply:
-    # Response container for Put/Append
     def __init__(self, value):
         self.value = value
 
+# Request container for Get operation
 class GetArgs:
-    # Holds key for a Get request
     def __init__(self, key):
         self.key = key
 
+# Reply container for Get operation
 class GetReply:
-    # Response container for Get
     def __init__(self, value):
         self.value = value
 
 class KVServer:
     def __init__(self, cfg):
-        self.mu = threading.Lock()                            # Ensures safe concurrent access
-        self.cfg = cfg                                        # Server configuration
-        self.kv: dict[str, str] = {}                          # Internal key-value database
-        self.last: dict[int, tuple[int, Any]] = {}            # Tracks last operation per client
-        self.me = None                                        # This server's index in the cluster
+        self.mu = threading.Lock()
+        self.cfg = cfg
+        self.kv: dict[str, str] = {}                      # Key-value store
+        self.last: dict[int, tuple[int, Any]] = {}        # Client op deduplication map
+        self.me = None                                    # Cached server ID
 
-    # Returns this server's index within the cluster
+    # Return this server's index within the configuration list
     def _my_id(self) -> int:
         if self.me is None:
             self.me = self.cfg.kvservers.index(self)
         return self.me
 
-    # Determines which server is responsible for a key
+    # Compute the primary server index for a given key
     def _primary_key(self, key: str) -> int:
         return _key_id(key) % self.cfg.nservers
 
-    # Returns True if this server is the primary for a given key
+    # Check if this server is the primary for the key
     def _primary(self, key: str) -> bool:
         return self._my_id() == self._primary_key(key)
 
-    # Checks whether this server belongs to the replica set for a key
+    # Determine whether this server is responsible for the given key
     def _responsible(self, key: str) -> bool:
         offset = (self._my_id() - self._primary_key(key)) % self.cfg.nservers
         return offset < self.cfg.nreplicas
 
+    # Replicate an operation to backup replicas of the shard
     def _replicate(self, key, new_val, client_id, seq, reply_val, op):
-        # Distribute the operation to backup replicas
         N, R = self.cfg.nservers, self.cfg.nreplicas
         primary = self._primary_key(key)
         for k in range(1, R):
             s_id = (primary + k) % N
             if s_id == self.me:
-                continue  # skip self
+                continue
             follower = self.cfg.kvservers[s_id]
             follower._app_rep(key, new_val, client_id, seq, reply_val, op)
 
+    # Apply an operation received from the primary (if not a duplicate)
     def _app_rep(self, key, new_val, client_id, seq, reply_val, op):
-        # Update replica’s state if the client’s operation is new
         with self.mu:
             last_op = self.last.get(client_id)
             if last_op and seq <= last_op[0]:
-                return  # duplicate or old
+                return
             self.kv[key] = new_val
             self.last[client_id] = (seq, reply_val)
 
+    # Handle Get RPC
     def Get(self, args: GetArgs) -> GetReply:
-        # If this server isn't responsible for the key, reject the request
         if not self._responsible(args.key):
             raise TimeoutError()
         with self.mu:
             value = self.kv.get(args.key, "")
-            self.cfg.op()  # For optional tracking/instrumentation
+            self.cfg.op()
         return GetReply(value)
 
+    # Handle Put RPC (only allowed on primary)
     def Put(self, args: PutAppendArgs) -> PutAppendReply:
         if not self._primary(args.key):
             return self._forward("Put", args)
@@ -127,6 +127,7 @@ class KVServer:
         self._replicate(args.key, args.value, args.client_id, args.seq, None, "Put")
         return PutAppendReply(None)
 
+    # Handle Append RPC (only allowed on primary)
     def Append(self, args: PutAppendArgs) -> PutAppendReply:
         if not self._primary(args.key):
             return self._forward("Append", args)
@@ -145,9 +146,10 @@ class KVServer:
         self._replicate(args.key, updated, args.client_id, args.seq, current, "Append")
         return PutAppendReply(current)
 
+    # Forward request to correct primary replica if not this server
     def _forward(self, op: str, args: PutAppendArgs):
         primary = self._primary_key(args.key)
-        timeout_limit = time.time() + 2.0  # Give up after 2 seconds
+        timeout_limit = time.time() + 2.0
 
         while time.time() < timeout_limit:
             endpoint_name = f"fwd-{self._my_id()}-{random.getrandbits(32)}"
@@ -158,7 +160,7 @@ class KVServer:
             try:
                 return connection.call(f"KVServer.{op}", args)
             except TimeoutError:
-                time.sleep(0.05)  # Retry after short pause
+                time.sleep(0.05)
             finally:
                 self.cfg.net.delete_end(endpoint_name)
 
