@@ -1,6 +1,28 @@
-import logging
-import threading
+# ------------------------------------------------------------------------------
+#                               Academic Honesty
+# ------------------------------------------------------------------------------
+#
+# This project implementation (`client.py`, `server.py`) was developed with 
+# structured assistance from **ChatGPT o3**. The AI was used to guide design 
+# decisions, explain unclear requirements, and improve documentation and code 
+# structure via multiple iterative prompts.
+#
+# Contributions included:
+# - Static key-to-shard mapping logic
+# - Client retry loops with replica fallback
+# - Handling of duplicate requests via client sequence tracking
+# - Thread-safe updates using locks
+# - Passing all course-provided test cases (e.g., `test_test.py`)
+#
+# No other external sources or third-party libraries (beyond course-provided files)
+# were used in creating this submission.
+#
+# ------------------------------------------------------------------------------
+
+import logging, threading, random
+import time, math
 from typing import Tuple, Any
+
 
 debugging = False
 
@@ -9,52 +31,135 @@ def debug(format, *args):
     if debugging:
         logging.info(format % args)
 
+def _key_id(key: str) -> int:
+    # Convert string to consistent positive integer for shard mapping
+    return int(key) if key.isdigit() else sum(ord(c) for c in key)
+
 # Put or Append
 class PutAppendArgs:
-    # Add definitions here if needed
-    def __init__(self, key, value):
-        self.key = key
-        self.value = value
-
+    # Holds data for Put or Append requests
+    def __init__(self, key: str, value: str, client_id: int, seq: int):
+        self.key, self.value, self.client_id, self.seq = key, value, client_id, seq
 class PutAppendReply:
-    # Add definitions here if needed
+    # Response container for Put/Append
     def __init__(self, value):
         self.value = value
 
 class GetArgs:
-    # Add definitions here if needed
+    # Holds key for a Get request
     def __init__(self, key):
         self.key = key
 
 class GetReply:
-    # Add definitions here if needed
+    # Response container for Get
     def __init__(self, value):
         self.value = value
 
 class KVServer:
     def __init__(self, cfg):
-        self.mu = threading.Lock()
-        self.cfg = cfg
+        self.mu = threading.Lock()                            # Ensures safe concurrent access
+        self.cfg = cfg                                        # Server configuration
+        self.kv: dict[str, str] = {}                          # Internal key-value database
+        self.last: dict[int, tuple[int, Any]] = {}            # Tracks last operation per client
+        self.me = None                                        # This server's index in the cluster
 
-        # Your definitions here.
+    # Returns this server's index within the cluster
+    def _my_id(self) -> int:
+        if self.me is None:
+            self.me = self.cfg.kvservers.index(self)
+        return self.me
 
-    def Get(self, args: GetArgs):
-        reply = GetReply(None)
+    # Determines which server is responsible for a key
+    def _primary_key(self, key: str) -> int:
+        return _key_id(key) % self.cfg.nservers
 
-        # Your code here.
+    # Returns True if this server is the primary for a given key
+    def _primary(self, key: str) -> bool:
+        return self._my_id() == self._primary_key(key)
 
-        return reply
+    # Checks whether this server belongs to the replica set for a key
+    def _responsible(self, key: str) -> bool:
+        offset = (self._my_id() - self._primary_key(key)) % self.cfg.nservers
+        return offset < self.cfg.nreplicas
 
-    def Put(self, args: PutAppendArgs):
-        reply = PutAppendReply(None)
+    def _replicate(self, key, new_val, client_id, seq, reply_val, op):
+        # Distribute the operation to backup replicas
+        N, R = self.cfg.nservers, self.cfg.nreplicas
+        primary = self._primary_key(key)
+        for k in range(1, R):
+            s_id = (primary + k) % N
+            if s_id == self.me:
+                continue  # skip self
+            follower = self.cfg.kvservers[s_id]
+            follower._app_rep(key, new_val, client_id, seq, reply_val, op)
 
-        # Your code here.
+    def _app_rep(self, key, new_val, client_id, seq, reply_val, op):
+        # Update replica’s state if the client’s operation is new
+        with self.mu:
+            last_op = self.last.get(client_id)
+            if last_op and seq <= last_op[0]:
+                return  # duplicate or old
+            self.kv[key] = new_val
+            self.last[client_id] = (seq, reply_val)
 
-        return reply
+    def Get(self, args: GetArgs) -> GetReply:
+        # If this server isn't responsible for the key, reject the request
+        if not self._responsible(args.key):
+            raise TimeoutError()
+        with self.mu:
+            value = self.kv.get(args.key, "")
+            self.cfg.op()  # For optional tracking/instrumentation
+        return GetReply(value)
 
-    def Append(self, args: PutAppendArgs):
-        reply = PutAppendReply(None)
+    def Put(self, args: PutAppendArgs) -> PutAppendReply:
+        if not self._primary(args.key):
+            return self._forward("Put", args)
 
-        # Your code here.
+        with self.mu:
+            last_op = self.last.get(args.client_id)
+            if last_op and args.seq <= last_op[0]:
+                return PutAppendReply(last_op[1])
 
-        return reply
+            self.kv[args.key] = args.value
+            self.last[args.client_id] = (args.seq, None)
+            self.cfg.op()
+
+        self._replicate(args.key, args.value, args.client_id, args.seq, None, "Put")
+        return PutAppendReply(None)
+
+    def Append(self, args: PutAppendArgs) -> PutAppendReply:
+        if not self._primary(args.key):
+            return self._forward("Append", args)
+
+        with self.mu:
+            last_op = self.last.get(args.client_id)
+            if last_op and args.seq <= last_op[0]:
+                return PutAppendReply(last_op[1])
+
+            current = self.kv.get(args.key, "")
+            updated = current + args.value
+            self.kv[args.key] = updated
+            self.last[args.client_id] = (args.seq, current)
+            self.cfg.op()
+
+        self._replicate(args.key, updated, args.client_id, args.seq, current, "Append")
+        return PutAppendReply(current)
+
+    def _forward(self, op: str, args: PutAppendArgs):
+        primary = self._primary_key(args.key)
+        timeout_limit = time.time() + 2.0  # Give up after 2 seconds
+
+        while time.time() < timeout_limit:
+            endpoint_name = f"fwd-{self._my_id()}-{random.getrandbits(32)}"
+            connection = self.cfg.net.make_end(endpoint_name)
+            self.cfg.net.connect(endpoint_name, primary)
+            self.cfg.net.enable(endpoint_name, primary in self.cfg.running_servers)
+
+            try:
+                return connection.call(f"KVServer.{op}", args)
+            except TimeoutError:
+                time.sleep(0.05)  # Retry after short pause
+            finally:
+                self.cfg.net.delete_end(endpoint_name)
+
+        raise TimeoutError()
